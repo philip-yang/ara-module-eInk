@@ -25,16 +25,51 @@
  * OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF
  * ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
- * Author: Fabien Parent <fparent@baylibre.com>
+ * Author: Philip Yang <philipy@bsquare.com>
  */
 
 #include <syslog.h>
+#include <errno.h>
+
+#include <nuttx/config.h>
+#include <nuttx/device.h>
+#include <nuttx/device_table.h>
+#include <nuttx/device_hid.h>
+
+#include <arch/tsb/gpio.h>
+
+#ifdef CONFIG_DEVICE_CORE
+static struct device devices[] = {
+    {
+        .type           = DEVICE_TYPE_HID_HW,
+        .name           = "hid_Button",
+        .desc           = "Button HID Driver",
+        .id             = 0,
+    },
+};
+
+static struct device_table bdb_device_table = {
+    .device = devices,
+    .device_count = ARRAY_SIZE(devices),
+};
+
+static void bdb_driver_register(void)
+{
+    extern struct device_driver hid_button_driver;
+    device_register_driver(&hid_button_driver);
+};
+#endif
 
 void ara_module_early_init(void)
 {
+    tsb_gpio_register(NULL);
 }
 
 void ara_module_init(void)
 {
-    lowsyslog("Skeleton Module init\n");
+    lowsyslog("E-Ink Module init\n");
+#ifdef CONFIG_DEVICE_CORE
+    device_table_register(&bdb_device_table);
+    bdb_driver_register();
+#endif
 }
