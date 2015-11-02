@@ -30,6 +30,8 @@ CWD := $(shell pwd)
 NUTTX_ROOT ?= ./nuttx
 TOPDIR := $(NUTTX_ROOT)/nuttx
 BUILDDIR := $(NUTTX_ROOT)/oot/nuttx
+DIRLINK = $(TOPDIR)/tools/link.sh
+DIRUNLINK = $(TOPDIR)/tools/unlink.sh
 
 obj += board-eInk-module.o
 obj += hid_button.o
@@ -52,6 +54,8 @@ all: nuttx_init build_fdk_bootstrap
 	./build.sh $(CWD) $(NUTTX_ROOT) && \
 	cp $(BUILDDIR)/nuttx $(CWD)/nuttx.elf && \
 	cp $(BUILDDIR)/nuttx.bin $(BUILDDIR)/System.map $(CWD)
+	$(DIRUNLINK) $(CWD)/nuttx/nuttx/include/arch/module
+	$(DIRUNLINK) $(CWD)/nuttx/nuttx/include/arch/clock
 
 build_fdk: $(obj)
 
@@ -66,6 +70,10 @@ nuttx_init:
 	cp scripts/Make.defs $(NUTTX_ROOT)/nuttx/
 	cp .config $(NUTTX_ROOT)/nuttx/.config
 	cd $(NUTTX_ROOT)/nuttx; $(MAKE) context
+	$(DIRLINK) $(CWD)/nuttx/nuttx/arch/arm/src/tsb \
+				$(CWD)/nuttx/nuttx/include/arch/module
+	$(DIRLINK) $(CWD)/nuttx/nuttx/sched/clock/ \
+				$(CWD)/nuttx/nuttx/include/arch/clock
 
 tftf: all
 	./bootrom-tools/create-tftf --elf nuttx.elf --unipro-mfg 0x126 \

@@ -39,8 +39,8 @@
 #include <nuttx/gpio.h>
 #include <nuttx/clock.h>
 
-#include "../nuttx/nuttx/sched/clock/clock.h"
-#include "../nuttx/nuttx/arch/arm/src/tsb/tsb_scm.h"
+#include <arch/clock/clock.h>
+#include <arch/module/tsb_scm.h>
 
 #define HID_DEVICE_FLAG_PROBE       BIT(0)
 #define HID_DEVICE_FLAG_OPEN        BIT(1)
