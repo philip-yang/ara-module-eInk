@@ -61,6 +61,8 @@
 
 #define HID_REPORT_DESC_LEN     35
 
+#define COMMAND_INTERVAL        1000    /* 1ms */
+
 static struct device *hid_dev = NULL;
 
 /**
@@ -99,6 +101,18 @@ struct button_info {
 
     /** The keycode for thsi button returned */
     uint8_t Keycode;
+
+    /** Notifying debounce count start */
+    sem_t active_debounce;
+
+    /** Handler for debounce count thread */
+    pthread_t pthread_handler;
+
+    /** inform the thread should be change debounce phase */
+    int thread_phase_change;
+
+    /** inform the thread should be terminated */
+    int thread_stop;
 };
 
 /**
@@ -122,9 +136,6 @@ struct hid_buttons_info {
 
     /** report length of each HID Reports */
     struct hid_size_info *sinfo;
-
-    /** multiple report structure support or not */
-    int multisupp;
 
     /** HID device state*/
     int state;
@@ -207,7 +218,11 @@ struct hid_kbd_data {
  */
 struct hid_size_info hid_sizeinfo[] =
 {
-    { 0, { 2, 0, 0 } }, /* parsed from HID Report Descriptor manually */
+    /**
+     * parsed from HID Report Descriptor manually, this case only support
+     * INPUT report, so the FEATURE and OUTPUT size is 0.
+     */
+    { 0, { 2, 0, 0 } },
 };
 
 /**
@@ -217,7 +232,7 @@ struct hid_size_info hid_sizeinfo[] =
  * @param gpio The button of gpio number
  * @return return button_info struct pointer or NULL for not find.
  */
-static struct button_info *get_btn_info(struct device *dev, uint16_t gpio)
+static struct button_info *btn_get_info(struct device *dev, uint16_t gpio)
 {
     struct hid_buttons_info *info = device_get_private(dev);
     struct button_info *dev_info = NULL;
@@ -241,23 +256,18 @@ static struct button_info *get_btn_info(struct device *dev, uint16_t gpio)
  * @param report_id HID report id
  * @return 0 on success, negative errno on error
  */
-static int hid_button_get_report_length(struct device *dev, uint8_t report_type,
-                                        uint8_t report_id)
+static int btn_get_report_length(struct device *dev, uint8_t report_type,
+                             uint8_t report_id)
 {
     struct hid_buttons_info *info = NULL;
     int ret = 0, i;
 
     /* check input parameters */
-    if (!dev || !dev->private || (report_type > HID_FEATURE_REPORT)) {
+    if (!dev || !dev->private) {
         return -EINVAL;
     }
 
     info = device_get_private(dev);
-
-    if (!(info->state & HID_DEVICE_FLAG_OPEN)) {
-        /* device isn't opened. */
-        return -EIO;
-    }
 
     /* lookup the hid_size_info table to find the report size */
     for (i = 0; i < info->num_ids; i++) {
@@ -278,7 +288,7 @@ static int hid_button_get_report_length(struct device *dev, uint8_t report_type,
  * @param len max input buffer size
  * @return 0 on success, negative for error
  */
-static int get_input_report(struct device *dev, uint8_t report_id,
+static int btn_get_input_report(struct device *dev, uint8_t report_id,
                             uint8_t *data, uint16_t len)
 {
     struct hid_buttons_info *info = NULL;
@@ -287,7 +297,7 @@ static int get_input_report(struct device *dev, uint8_t report_id,
 
     info = device_get_private(dev);
 
-    rptlen = hid_button_get_report_length(dev, HID_INPUT_REPORT, report_id);
+    rptlen = btn_get_report_length(dev, HID_INPUT_REPORT, report_id);
 
     if (rptlen) {
         if (!report_id) {
@@ -299,120 +309,28 @@ static int get_input_report(struct device *dev, uint8_t report_id,
             kbd->modifier = info->modifier;
             kbd->keycode = 0;
         } else {
-            /* For current case, we don't support multiple Report ID structure,
-             * so just returns error code */
+            /* No multiple Report ID in this application. */
             ret = -EIO;
         }
     } else {
-        /* Can't find Input Report structure in report descriptor. */
+        /* Required Input Report in report descriptor was not found. */
         ret = -EIO;
     }
     return ret;
 }
 
 /**
- * @brief Get HID Feature report data
- *
- * @param dev pointer to structure of device data
- * @param report_id HID report id
- * @param data pointer of input buffer size
- * @param len max input buffer size
- * @return 0 on success, negative for error
- */
-static int get_feature_report(struct device *dev, uint8_t report_id,
-                            uint8_t *data, uint16_t len)
-{
-    int ret = 0, rptlen = 0;
-
-    rptlen = hid_button_get_report_length(dev, HID_FEATURE_REPORT, report_id);
-
-    if (rptlen) {
-        /* For current HID case, HID Report Descriptor doesn't contain a
-         * Feature Report structure, so I just return -EIO error code. */
-        ret = -EIO;
-    } else {
-        /* Can't find Feature Report structure in report descriptor. */
-        ret = -EIO;
-    }
-    return ret;
-}
-
-/**
- * @brief Set HID Output report data
- *
- * @param dev pointer to structure of device data
- * @param report_id HID report id
- * @param data pointer of output buffer size
- * @param len max output buffer size
- * @return 0 on success, negative errno on error
- */
-static int set_output_report(struct device *dev, uint8_t report_id,
-                             uint8_t *data, uint16_t len)
-{
-    int ret = 0, rptlen = 0;
-
-    rptlen = hid_button_get_report_length(dev, HID_OUTPUT_REPORT, report_id);
-
-    if (rptlen) {
-        /* For current test case, HID Report Descriptor doesn't contain a
-         * Output Report structure, so I just return -EIO error code. */
-        ret = -EIO;
-    } else {
-        /* Can't find Output Report structure in report descriptor. */
-        ret = -EIO;
-    }
-    return ret;
-}
-
-/**
- * @brief Set HID Feature report data
- *
- * @param dev pointer to structure of device data
- * @param report_id HID report id
- * @param data pointer of output buffer size
- * @param len max output buffer size
- * @return 0 on success, negative errno on error
- */
-static int set_feature_report(struct device *dev, uint8_t report_id,
-                              uint8_t *data, uint16_t len)
-{
-    int ret = 0, rptlen = 0;
-
-    rptlen = hid_button_get_report_length(dev, HID_FEATURE_REPORT, report_id);
-
-    if (rptlen) {
-        /* For current test case, HID Report Descriptor doesn't contain a
-         * Feature Report structure, so I just return -EIO error code. */
-        ret = -EIO;
-    } else {
-        /* Can't find Feature Report structure in report descriptor. */
-        ret = -EIO;
-    }
-    return ret;
-}
-
-/**
- * @brief Filter GPIO signal debounce
+ * @brief Enable GPIO signal debounce filter
  *
  * @param dev pointer to structure of device data
  * @param btn pointer to structure of button_info
  * @param irq IRQ number.
  * @return 0 on success, negative errno on error
  */
-static int hid_check_btn_debounce(struct device *dev,
-                                  struct button_info *btn_info, int irq)
+static int btn_software_debounce(struct device *dev,
+                                 struct button_info *btn_info, int irq)
 {
-    struct hid_buttons_info *info = device_get_private(dev);
-    struct hid_kbd_data kbd;
     uint8_t value = 0;
-    int ticks = 0, elapsed = 0;
-
-    clock_time2ticks(&btn_info->last_activetime, &ticks);
-    elapsed = clock_systimer() - ticks;
-
-    if (elapsed < DEBOUNCE_TIMEING) {
-        return -EAGAIN;
-    }
 
     gpio_mask_irq(irq);
 
@@ -421,15 +339,11 @@ static int hid_check_btn_debounce(struct device *dev,
     /* check whether the key state change or not */
     if (btn_info->last_keystate != value) {
         btn_info->last_keystate = value;
-        clock_ticks2time(clock_systimer(), &btn_info->last_activetime);
-        /* get keyboard data and send to upper layer */
-        kbd.modifier = info->modifier;
-        kbd.keycode = btn_info->last_keystate ? btn_info->Keycode : 0;
 
-        if (info->event_callback) {
-            info->event_callback(dev, HID_INPUT_REPORT, (uint8_t*)&kbd,
-                                 sizeof(struct hid_kbd_data));
-        }
+        /* Enable counign thread by phase */
+        btn_info->thread_phase_change = 1;
+        clock_ticks2time(clock_systimer(), &btn_info->last_activetime);
+        sem_post(&btn_info->active_debounce);
     }
 
     gpio_unmask_irq(irq);
@@ -453,12 +367,12 @@ int hid_handle_kbdup_irq_event(int irq, FAR void *context)
         return ERROR;
     }
 
-    dev_info = get_btn_info(dev, GPIO_KBDPAGEUP);
+    dev_info = btn_get_info(dev, GPIO_KBDPAGEUP);
     if (!dev_info) {
         return ERROR;
     }
 
-    ret = hid_check_btn_debounce(dev, dev_info, irq);
+    ret = btn_software_debounce(dev, dev_info, irq);
     if (ret) {
         return -EAGAIN;
     }
@@ -482,12 +396,12 @@ int hid_handle_kbddn_irq_event(int irq, FAR void *context)
         return ERROR;
     }
 
-    dev_info = get_btn_info(dev, GPIO_KBDPAGEDOWN);
+    dev_info = btn_get_info(dev, GPIO_KBDPAGEDOWN);
     if (!dev_info) {
         return ERROR;
     }
 
-    ret = hid_check_btn_debounce(dev, dev_info, irq);
+    ret = btn_software_debounce(dev, dev_info, irq);
     if (ret) {
         return -EAGAIN;
     }
@@ -585,6 +499,7 @@ err_poweroff:
 static int hid_button_get_desc(struct device *dev, struct hid_descriptor *desc)
 {
     struct hid_buttons_info *info = NULL;
+    int ret = 0;
 
     /* check input parameters */
     if (!dev || !dev->private || !desc) {
@@ -593,14 +508,20 @@ static int hid_button_get_desc(struct device *dev, struct hid_descriptor *desc)
 
     info = device_get_private(dev);
 
+    sem_wait(&info->lock);
+
     if (!(info->state & HID_DEVICE_FLAG_OPEN)) {
         /* device isn't opened. */
-        return -EIO;
+        ret = -EIO;
+        goto err_desc;
     }
 
     /* get HID device descriptor */
     memcpy(desc, info->hdesc, sizeof(struct hid_descriptor));
-    return 0;
+
+err_desc:
+    sem_post(&info->lock);
+    return ret;
 }
 
 /**
@@ -613,6 +534,7 @@ static int hid_button_get_desc(struct device *dev, struct hid_descriptor *desc)
 static int hid_button_get_report_desc(struct device *dev, uint8_t *desc)
 {
     struct hid_buttons_info *info = NULL;
+    int ret = 0;
 
     /* check input parameters */
     if (!dev || !dev->private || !desc) {
@@ -621,40 +543,44 @@ static int hid_button_get_report_desc(struct device *dev, uint8_t *desc)
 
     info = device_get_private(dev);
 
+    sem_wait(&info->lock);
+
     if (!(info->state & HID_DEVICE_FLAG_OPEN)) {
         /* device isn't opened. */
-        return -EIO;
+        ret = -EIO;
+        goto err_report_desc;
     }
 
     /* get HID report descriptor */
     memcpy(desc, info->rdesc, info->hdesc->report_desc_length);
-    return 0;
+
+err_report_desc:
+    sem_post(&info->lock);
+    return ret;
 }
 
 /**
- * @brief Get HID maximum report size in all Report ID for each Report type
+ * @brief Get maximum report descriptor size
+ *
+ * Since the descriptor size is flexible for each REPORT type, so to create
+ * this function for caller if they need.
  *
  * @param dev pointer to structure of device data
  * @param report_type HID report type
  * @return the report size on success, negative errno on error
  */
-static int hid_button_get_maximum_report_length(struct device *dev,
+static int btn_get_maximum_report_length(struct device *dev,
                                                 uint8_t report_type)
 {
     struct hid_buttons_info *info = NULL;
     int i = 0, maxlen = 0, id = 0;
 
     /* check input parameters */
-    if (!dev || !dev->private || (report_type > HID_FEATURE_REPORT)) {
+    if (!dev || !dev->private) {
         return -EINVAL;
     }
 
     info = device_get_private(dev);
-
-    if (!(info->state & HID_DEVICE_FLAG_OPEN)) {
-        /* device isn't opened. */
-        return -EIO;
-    }
 
     /* lookup the hid_size_info table to find the max report size
      * in specific Report type  */
@@ -665,8 +591,10 @@ static int hid_button_get_maximum_report_length(struct device *dev,
             maxlen = info->sinfo[i].size[report_type];
         }
     }
-    /* If the Report ID isn't zero, add an extra 1-byte space to save
-     * the Report ID.*/
+
+    /* If the Report ID isn't zero, add an extra 1-byte in return lenght for
+     * Report ID store.
+     */
     if (id) {
         maxlen++;
     }
@@ -699,6 +627,7 @@ static int hid_button_get_report(struct device *dev, uint8_t report_type,
     info = device_get_private(dev);
 
     sem_wait(&info->lock);
+
     if (!(info->state & HID_DEVICE_FLAG_OPEN)) {
         /* device isn't opened. */
         ret = -EIO;
@@ -707,13 +636,10 @@ static int hid_button_get_report(struct device *dev, uint8_t report_type,
 
     switch (report_type) {
         case HID_INPUT_REPORT:
-            ret = get_input_report(dev, report_id, data, len);
-        break;
-        case HID_FEATURE_REPORT:
-            ret = get_feature_report(dev, report_id, data, len);
+            ret = btn_get_input_report(dev, report_id, data, len);
         break;
         default:
-            /* only support input and feature report */
+            /* only support input report */
             ret = -EINVAL;
         break;
     }
@@ -737,39 +663,8 @@ static int hid_button_set_report(struct device *dev, uint8_t report_type,
                                  uint8_t report_id, uint8_t *data,
                                  uint16_t len)
 {
-    struct hid_buttons_info *info = NULL;
-    int ret = 0;
-
-    /* check input parameters */
-    if (!dev || !dev->private || !data) {
-        return -EINVAL;
-    }
-
-    info = device_get_private(dev);
-
-    sem_wait(&info->lock);
-
-    if (!(info->state & HID_DEVICE_FLAG_OPEN)) {
-        /* device isn't opened. */
-        ret = -EIO;
-        goto err_setreport;
-    }
-
-    switch (report_type) {
-        case HID_OUTPUT_REPORT:
-            ret = set_output_report(dev, report_id, data, len);
-        break;
-        case HID_FEATURE_REPORT:
-            ret = set_feature_report(dev, report_id, data, len);
-        break;
-        default:
-            /* only support output and feature report */
-            ret = -EINVAL;
-        break;
-    }
-err_setreport:
-    sem_post(&info->lock);
-    return ret;
+    /* only support INPUT report, so no set report operation need. */
+    return -EINVAL;
 }
 
 /**
@@ -826,26 +721,167 @@ static int hid_button_unregister_callback(struct device *dev)
 }
 
 /**
- * @brief Deinitialze GPIO and resource
+ * @brief Debounce check therad for PAGEUP
  *
  * @param dev pointer to structure of device data
  */
-static void hid_button_gpio_deinit(struct device *dev)
+static void *btn_pgup_bebounce_thread(void *data)
 {
+    struct device *dev = hid_dev;
+    struct hid_buttons_info *info = device_get_private(dev);
     struct button_info *btn_info = NULL;
-    int i;
+    struct hid_kbd_data kbd;
+    int ticks = 0, elapsed = 0;
+    uint8_t value = 0;
 
-    for (i = 0; i < MAX_IO_INPUT; i++) {
-        btn_info = get_btn_info(dev, i);
-        if (!btn_info) {
-            continue;
-        } else {
-            gpio_mask_irq(btn_info->gpio);
-            gpio_deactivate(btn_info->gpio);
-            list_del(&btn_info->list);
-            free(btn_info);
+    btn_info = btn_get_info(dev, GPIO_KBDPAGEUP);
+    if(!btn_info) {
+        return NULL;
+    }
+
+    while (1) {
+        sem_wait(&btn_info->active_debounce);
+
+        if (btn_info->thread_stop) {
+            break;
+        }
+
+        if (btn_info->thread_phase_change) {
+            /* clear timer count and restart count */
+            btn_info->thread_phase_change = 0;
+            ticks = 0;
+            elapsed = 0;
+        }
+
+        for(;;) {
+            /* verify key status is still same during counting */
+            value = gpio_get_value(btn_info->gpio);
+            if (value != btn_info->last_keystate) {
+                btn_info->last_keystate = value;
+                break;
+            }
+
+            /* count > 250mS routine */
+            clock_time2ticks(&btn_info->last_activetime, &ticks);
+            elapsed = clock_systimer() - ticks;
+
+            if (elapsed > DEBOUNCE_TIMEING) {
+                kbd.modifier = info->modifier;
+                kbd.keycode = btn_info->last_keystate ? btn_info->Keycode : 0;
+
+                if (info->event_callback) {
+                    info->event_callback(dev, HID_INPUT_REPORT, (uint8_t*)&kbd,
+                                         sizeof(struct hid_kbd_data));
+                }
+                break;
+            } else {
+                usleep(COMMAND_INTERVAL);
+            }
         }
     }
+
+    return NULL;
+}
+
+/**
+ * @brief Debounce check therad for PAGEDOWN
+ *
+ * @param dev pointer to structure of device data
+ */
+static void *btn_pgdn_bebounce_thread(void *data)
+{
+    struct device *dev = hid_dev;
+    struct hid_buttons_info *info = device_get_private(dev);
+    struct button_info *btn_info = NULL;
+    struct hid_kbd_data kbd;
+    int ticks = 0, elapsed = 0;
+    uint8_t value = 0;
+
+    btn_info = btn_get_info(dev, GPIO_KBDPAGEDOWN);
+    if(!btn_info)
+        return NULL;
+
+    while (1) {
+        sem_wait(&btn_info->active_debounce);
+
+        if (btn_info->thread_stop) {
+            break;
+        }
+
+        if (btn_info->thread_phase_change) {
+            /* clear timer count and restart count */
+            btn_info->thread_phase_change = 0;
+            ticks = 0;
+            elapsed = 0;
+        }
+
+        for(;;) {
+            /* verify key status is still same during counting */
+            value = gpio_get_value(btn_info->gpio);
+            if (value != btn_info->last_keystate) {
+                btn_info->last_keystate = value;
+                break;
+            }
+
+            /* count > 250mS routine */
+            clock_time2ticks(&btn_info->last_activetime, &ticks);
+            elapsed = clock_systimer() - ticks;
+
+            if (elapsed > DEBOUNCE_TIMEING) {
+                kbd.modifier = info->modifier;
+                kbd.keycode = btn_info->last_keystate ? btn_info->Keycode : 0;
+
+                if (info->event_callback) {
+                    info->event_callback(dev, HID_INPUT_REPORT, (uint8_t*)&kbd,
+                                         sizeof(struct hid_kbd_data));
+                }
+                break;
+            } else {
+                usleep(COMMAND_INTERVAL);
+            }
+        }
+    }
+
+    return NULL;
+}
+
+/**
+ * @brief Deinitialze a specific GPIO
+ *
+ * @param dev pointer to structure of device data
+ */
+void btn_gpio_deinit(struct button_info *btn_info)
+{
+    if (btn_info->pthread_handler != (pthread_t)0) {
+        btn_info->thread_stop = 1;
+        sem_post(&btn_info->active_debounce);
+        pthread_join(btn_info->pthread_handler, NULL);
+    }
+    sem_destroy(&btn_info->active_debounce);
+    gpio_mask_irq(btn_info->gpio);
+    gpio_deactivate(btn_info->gpio);
+    list_del(&btn_info->list);
+    free(btn_info);
+}
+
+/**
+ * @brief Deinitialze GPIOs and resources
+ *
+ * @param dev pointer to structure of device data
+ */
+static void hid_button_gpios_deinit(struct device *dev)
+{
+    struct button_info *btn_info = NULL;
+
+    btn_info = btn_get_info(dev, GPIO_KBDPAGEUP);
+    if (btn_info)
+        btn_gpio_deinit(btn_info);
+
+    btn_info = btn_get_info(dev, GPIO_KBDPAGEDOWN);
+    if (btn_info)
+        btn_gpio_deinit(btn_info);
+
+    return;
 }
 
 /**
@@ -858,35 +894,51 @@ static int hid_button_gpio_init(struct device *dev, uint16_t gpio)
 {
     struct hid_buttons_info *info = device_get_private(dev);
     struct button_info *btn_info = NULL;
+    int ret = 0;
 
-    if (gpio == GPIO_KBDPAGEUP || gpio == GPIO_KBDPAGEDOWN) {
-        btn_info = zalloc(sizeof(*btn_info));
-        if (!btn_info)
-            return -ENOMEM;
-
-        btn_info->gpio = gpio;
-
-        gpio_activate(gpio);
-        gpio_direction_in(gpio);
-        gpio_mask_irq(gpio);
-        set_gpio_triggering(gpio, IRQ_TYPE_EDGE_BOTH);
-
-        if (gpio == GPIO_KBDPAGEUP) {
-            gpio_irqattach(gpio, hid_handle_kbdup_irq_event);
-            btn_info->Keycode = KEYCODE_PAGEUP;
-        }
-
-        if (gpio == GPIO_KBDPAGEDOWN) {
-            gpio_irqattach(gpio, hid_handle_kbddn_irq_event);
-            btn_info->Keycode = KEYCODE_PAGEDOWN;
-        }
-
-        list_add(&info->buttons_list, &btn_info->list);
-    }
-    else
+    if (gpio != GPIO_KBDPAGEUP && gpio != GPIO_KBDPAGEDOWN) {
         return -EIO;
+    }
 
-    return 0;
+    btn_info = zalloc(sizeof(*btn_info));
+    if (!btn_info)
+        return -ENOMEM;
+
+    btn_info->gpio = gpio;
+
+    gpio_activate(gpio);
+    gpio_direction_in(gpio);
+    gpio_mask_irq(gpio);
+    set_gpio_triggering(gpio, IRQ_TYPE_EDGE_BOTH);
+    sem_init(&btn_info->active_debounce, 0, 0);
+    list_add(&info->buttons_list, &btn_info->list);
+
+    if (gpio == GPIO_KBDPAGEUP) {
+        btn_info->Keycode = KEYCODE_PAGEUP;
+        ret = pthread_create(&btn_info->pthread_handler, NULL,
+                             btn_pgup_bebounce_thread, btn_info);
+        if (ret) {
+            goto err_gpio_init;
+        }
+        gpio_irqattach(gpio, hid_handle_kbdup_irq_event);
+
+    } else if (gpio == GPIO_KBDPAGEDOWN) {
+        btn_info->Keycode = KEYCODE_PAGEDOWN;
+        ret = pthread_create(&btn_info->pthread_handler, NULL,
+                             btn_pgdn_bebounce_thread, btn_info);
+        if (ret) {
+            goto err_gpio_init;
+        }
+        gpio_irqattach(gpio, hid_handle_kbddn_irq_event);
+    } else {
+        goto err_gpio_init;
+    }
+
+    return ret;
+
+err_gpio_init:
+    hid_button_gpios_deinit(dev);
+    return ret;
 }
 
 /**
@@ -909,6 +961,7 @@ static int hid_button_open(struct device *dev)
     if (!dev || !dev->private) {
         return -EINVAL;
     }
+
     info = device_get_private(dev);
 
     sem_wait(&info->lock);
@@ -922,15 +975,6 @@ static int hid_button_open(struct device *dev)
         /* device has been opened, return error */
         ret = -EBUSY;
         goto err_open;
-    }
-
-    info->hdesc = &hid_dev_desc;
-    info->rdesc = hid_report_desc;
-    info->sinfo = hid_sizeinfo;
-    info->num_ids = ARRAY_SIZE(hid_sizeinfo);
-    /* check whether or not to support multiple report structure */
-    if (info->num_ids > 1) {
-        info->multisupp = 1;
     }
 
     info->event_callback = NULL;
@@ -953,11 +997,8 @@ static int hid_button_open(struct device *dev)
     }
 
     info->state |= HID_DEVICE_FLAG_OPEN;
-    goto open_exit;
 
 err_open:
-    hid_button_gpio_deinit(dev);
-open_exit:
     sem_post(&info->lock);
     return ret;
 }
@@ -995,12 +1036,7 @@ static void hid_button_close(struct device *dev)
     }
 
     /* uninitialize GPIO pin */
-    hid_button_gpio_deinit(dev);
-
-    info->hdesc = NULL;
-    info->rdesc = NULL;
-    info->sinfo = NULL;
-    info->num_ids = 0;
+    hid_button_gpios_deinit(dev);
 
     info->event_callback = NULL;
 
@@ -1037,13 +1073,21 @@ static int hid_button_probe(struct device *dev)
         return -ENOMEM;
     }
 
-    irqrestore(flags);
+    flags = irqsave();
+
+    /** Temporary to use GPIO 0/9 as button up/dowm key for testing */
     tsb_set_pinshare(TSB_PIN_GPIO9);
+    tsb_clr_pinshare(TSB_PIN_UART_CTSRTS);
 
     hid_dev = dev;
     info->dev = dev;
     info->state = HID_DEVICE_FLAG_PROBE;
     dev->private = info;
+
+    info->hdesc = &hid_dev_desc;
+    info->rdesc = hid_report_desc;
+    info->sinfo = hid_sizeinfo;
+    info->num_ids = ARRAY_SIZE(hid_sizeinfo);
 
     info->buttons_list.prev = &info->buttons_list;
     info->buttons_list.next = &info->buttons_list;
@@ -1051,6 +1095,7 @@ static int hid_button_probe(struct device *dev)
     sem_init(&info->lock, 0, 1);
 
     irqrestore(flags);
+
     return 0;
 }
 
@@ -1080,6 +1125,10 @@ static void hid_button_remove(struct device *dev)
         hid_button_close(dev);
     }
 
+    info->hdesc = NULL;
+    info->rdesc = NULL;
+    info->sinfo = NULL;
+    info->num_ids = 0;
     info->state = 0;
     sem_destroy(&info->lock);
 
@@ -1093,8 +1142,8 @@ static struct device_hid_type_ops hid_button_type_ops = {
     .power_off = hid_button_power_off,
     .get_descriptor = hid_button_get_desc,
     .get_report_descriptor = hid_button_get_report_desc,
-    .get_report_length = hid_button_get_report_length,
-    .get_maximum_report_length = hid_button_get_maximum_report_length,
+    .get_report_length = btn_get_report_length,
+    .get_maximum_report_length = btn_get_maximum_report_length,
     .get_report = hid_button_get_report,
     .set_report = hid_button_set_report,
     .register_callback = hid_button_register_callback,
